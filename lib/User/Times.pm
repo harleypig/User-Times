@@ -5,49 +5,22 @@ package User::Times;
 #use 5.10
 use strict;
 use warnings;
-use namespace::autoclean;
 
 use Carp;
 use User::Utmp qw( :constants );
 
-#my %type = (
-#
-#  BOOT_TIME()     => 'BOOT_TIME',
-#  DEAD_PROCESS()  => 'DEAD_PROCESS',
-#  EMPTY()         => 'EMPTY',
-#  INIT_PROCESS()  => 'INIT_PROCESS',
-#  LOGIN_PROCESS() => 'LOGIN_PROCESS',
-#  NEW_TIME()      => 'NEW_TIME',
-#  OLD_TIME()      => 'OLD_TIME',
-#  RUN_LVL()       => 'RUN_LVL',
-#  USER_PROCESS()  => 'USER_PROCESS',
-#
-#);
+use Sub::Exporter -setup => { exports => [ 'user_times' ] };
 
 # Default to UTMPX
 #
 # If ! HAS_UTMPX or UTMP is specifically requested
 #   then revert to Utmp functions.
 
-sub times {
+sub user_times {
 
   my %args = @_ == 1     ? ( 'file', +shift )
            : @_ % 2 == 0 ? @_
            : do { carp 'Invalid parameter list' };
-
-#  if ( @_ == 1 ) {
-#
-#    $args{ file } = +shift;
-#
-#  } elsif ( @_ % 2 == 0 ) {
-#
-#    %args = @_;
-#
-#  } else {
-#
-#    carp "Invalid number of parameters.";
-#
-#  }
 
   $args{ utmp } ||= 0;
 
@@ -55,21 +28,19 @@ sub times {
 
   if ( HAS_UTMPX() && ! $args{ utmp } ) {
 
-    $setfile        = 'utmpxname';
-    $getrec         = 'getutx';
+    $setfile        = \&User::Utmp::utmpxname;
+    $getrec         = \&User::Utmp::getutx;
     $args{ file } ||= User::Utmp::WTMPX_FILE;
 
   } else {
 
-    $setfile        = 'utmpname';
-    $getrec         = 'getut';
+    $setfile        = \&User::Utmp::utmpname;
+    $getrec         = \&User::Utmp::getut;
     $args{ file } ||= User::Utmp::WTMP_FILE;
 
   }
 
-  no strict 'refs';
-  "User::Utmp::$setfile"->( $args{ file } );
-  use strict 'refs';
+  $setfile->( $args{ file } );
 
   # Single record output:
   #
@@ -90,55 +61,63 @@ sub times {
   #
   # james => {
   #   loggedin => 1,
-  #   session  => [
-  #     { pid      => 6003,
-  #       addr     => '',
+  #   sessions  => [
+  #     { addr     => '',
+  #       crash    => 0,
   #       host     => ':0',
   #       id       => 'ts/1',
   #       line     => 'pts/1',
+  #       pid      => 6003,
+  #
+  #       exit     => 0,
+  #       termination => 0,
+  #
   #       in       => 0,
   #       in_usec  => 0,
   #       out      => 1322780606,
   #       out_usec => 381683,
-  #       crash    => 0,
   #     },
   #   ],
+  #   session => {
+  #     6003 => \%session_hash (see above),
+  #   },
   # },
 
   # PID     USER_PROCESS username is login
   # SAMEPID DEAD_PROCESS username is logout
 
-  my @fields = qw( addr host id line pid );
-
   my %session_tmpl = (
 
-    pid      => 0,
     addr     => '',
+    crash    => 0,
     host     => '',
     id       => '',
     line     => '',
+    pid      => 0,
+
+    exit        => 0,
+    termination => 0,
+
     in       => 0,
     in_usec  => 0,
     out      => 0,
     out_usec => 0,
-    crash    => 0,
 
   );
 
+  my @simple_fields = qw( addr crash host id line pid );
+
   my %info;
 
-  no strict 'refs';
-  for my $rec ( "User::Utmp::$getrec"->() ) {
+  for my $rec ( $getrec->() ) {
 
-    use strict 'refs';
+    #next if $rec->{ ut_user } eq ''; # How does this happen? Do I need to
+    #                                 # worry about it?
 
-    my $user = $info{ $rec->{ ut_user } } ||= {};
+    # Ignore or special handling for these usernames
+    next if $rec->{ ut_user } =~ /^(?:LOGIN|reboot|runlevel|shutdown)$/i;
 
-    $user->{ loggedin } = 0
-      unless exists $user->{ loggedin };
-
-    $user->{ session } = []
-      unless exists $user->{ session };
+    next unless $rec->{ ut_user } eq 'james';
 
     if ( $rec->{ ut_type } eq BOOT_TIME() ) {
 
@@ -147,850 +126,85 @@ sub times {
 
     } elsif ( $rec->{ ut_type } eq USER_PROCESS() ) { # create a new session (user has logged in)
 
-      $user->{ loggedin } = 1;
+      next if $rec->{ ut_user } eq ''; # as far as I can tell, this shouldn't happen, except on boot.
+
+      my $user = $info{ $rec->{ ut_user } } ||= { loggedin => 0, session => [], session => {} };
 
       my %session = %session_tmpl;
-      %session = map { ( $_, $rec->{ "ut_$_" } ) } @fields;
+
+      $session{ $_ } = $rec->{ "ut_$_" }
+        for @simple_fields;
+
+      $session{ $_ } = $rec->{ "ut_exit" }{ "e_$_" }
+        for qw( exit termination );
+
+      $session{ in }      = $rec->{ ut_tv }{ tv_sec };
+      $session{ in_usec } = $rec->{ ut_tv }{ tv_usec };
+
+      push @{ $user->{ sessions } }, \%session;
+
+$DB::single = 1 if exists $user->{ session }{ $session{ pid } };
+
+      croak "Does this happen often enough I need to program around it?"
+        if exists $user->{ session }{ $session{ pid } };
+
+      $user->{ session }{ $session{ pid } } = \%session;
+      $user->{ loggedin }++;
+
+printf "login %15s: %2d (%s)\n",
+  $rec->{ ut_user }, $user->{ loggedin }, scalar localtime( $session{ in } );
+
+      push @{ $user->{ inout } }, [ $session{ in }, 0 ]
+        if $user->{ 'loggedin' } == 1;
 
     } elsif ( $rec->{ ut_type } eq DEAD_PROCESS() ) {
 
-      # Close a session (creating a new one if we don't have an existing session).
+      # Some programs will null the ut_user field, so if ut_user is null then
+      # we need to find the pid amongst the data.
 
-      # Check if any session for this user is still logged in before setting this to 0.
-      $user->{ loggedin } = 0;
+      unless ( exists $info{ $rec->{ ut_user } } ) {
+
+        find pid!
+
+      }
+
+      # I may need to revisit this ... in the case of a DEAD_PROCESS for
+      # a user that doesn't have an equivalent USER_PROCESS I'm going to
+      # assume the login happened *before* the beginning of the current file
+      # and ignore it. Also has the side effect of ignoring users explicitly
+      # ignored in the USER_PROCESS section above.
+
+      next unless exists $info{ $rec->{ ut_user } };
+
+      my $user = $info{ $rec->{ ut_user } };
+
+      # Ignore if the pid doesn't exist, another way of assuming the user
+      # logged in before the beginning of the utmp file.
+
+      next unless exists $user->{ session }{ $rec->{ ut_pid } };
+
+      $user->{ session }{ $rec->{ ut_pid } }{ out }      = $rec->{ ut_tv }{ tv_sec };
+      $user->{ session }{ $rec->{ ut_pid } }{ out_usec } = $rec->{ ut_tv }{ tv_usec };
+
+$DB::single = 1 if $user->{ loggedin } == 1;
+
+      $user->{ loggedin }--;
+
+printf "login %15s: %2d (%s)\n",
+  $rec->{ ut_user }, $user->{ loggedin }, scalar localtime( $user->{ session }{ $rec->{ ut_pid } }{ out } );
+
+$DB::single = 1 if $user->{ loggedin } == 0;
+
+      $user->{ inout }[-1][-1] = $rec->{ ut_tv }{ tv_sec }
+        if $user->{ loggedin } == 0;
 
     }
-
   }
 
-  use strict 'refs';
+  $DB::single = 1;
+
+  return \%info;
 
 }
-
-#     6003 USER_PROCESS  1322780606 pts/1 james
-#     5842 USER_PROCESS  1322780606 pts/2 james
-#     6000 DEAD_PROCESS  1322780713 pts/1 james
-#     5842 DEAD_PROCESS  1322780714 pts/2 james
-#     6489 USER_PROCESS  1322782507 pts/1 james
-#     6329 USER_PROCESS  1322782507 pts/2 james
-#     6486 DEAD_PROCESS  1322783621 pts/1 james
-#     6329 DEAD_PROCESS  1322783996 pts/2 james
-#     7204 USER_PROCESS  1322785183 pts/1 james
-#     7434 USER_PROCESS  1322785232 pts/2 james
-#     7432 DEAD_PROCESS  1322786987 pts/2 james
-#     7204 DEAD_PROCESS  1322787027 pts/1 james
-#     8060 USER_PROCESS  1322787624 pts/1 james
-#     8300 USER_PROCESS  1322787714 pts/2 james
-#     8298 DEAD_PROCESS  1322789686 pts/2 james
-#     8060 DEAD_PROCESS  1322789703 pts/1 james
-#     9016 USER_PROCESS  1322791431 pts/1 darkshadow
-#     9016 DEAD_PROCESS  1322791508 pts/1 darkshadow
-#     9616 USER_PROCESS  1322794482 pts/1 james
-#     9845 USER_PROCESS  1322794535 pts/2 james
-#     9843 DEAD_PROCESS  1322797235 pts/2 james
-#     9616 DEAD_PROCESS  1322797236 pts/1 james
-#    10708 USER_PROCESS  1322797961 pts/1 deedee
-#    10708 DEAD_PROCESS  1322798097 pts/1 deedee
-#    11464 USER_PROCESS  1322799095 pts/1 harleypig
-#    11695 USER_PROCESS  1322799197 pts/2 harleypig
-#    12860 USER_PROCESS  1322800483 pts/3 harleypig
-#    11693 DEAD_PROCESS  1322809695 pts/3 harleypig
-#    11693 DEAD_PROCESS  1322809715 pts/2 harleypig
-#    11464 DEAD_PROCESS  1322809727 pts/1 harleypig
-#    16691 USER_PROCESS  1322867342 pts/1 james
-#    16506 USER_PROCESS  1322867343 pts/2 james
-#    16678 DEAD_PROCESS  1322868738 pts/1 james
-#    16506 DEAD_PROCESS  1322871349 pts/2 james
-#    17446 USER_PROCESS  1322872885 pts/1 robert
-#    17446 DEAD_PROCESS  1322872913 pts/1 robert
-#    17844 USER_PROCESS  1322873207 pts/1 robert
-#    18125 USER_PROCESS  1322873296 pts/2 robert
-#    18123 DEAD_PROCESS  1322874903 pts/2 robert
-#    17844 DEAD_PROCESS  1322874914 pts/1 robert
-#    18984 USER_PROCESS  1322874957 pts/1 james
-#    18984 DEAD_PROCESS  1322876743 pts/1 james
-#    20431 USER_PROCESS  1322876762 pts/1 james
-#    20637 USER_PROCESS  1322876811 pts/2 james
-#    21252 USER_PROCESS  1322878575 pts/1 james
-#    21481 USER_PROCESS  1322878597 pts/2 james
-#    21479 DEAD_PROCESS  1322880836 pts/2 james
-#    21252 DEAD_PROCESS  1322881862 pts/1 james
-#    22950 USER_PROCESS  1322881898 pts/1 robert
-#    23477 USER_PROCESS  1322884300 pts/1 robert
-#    23477 DEAD_PROCESS  1322891996 pts/1 robert
-#    24276 USER_PROCESS  1322895747 pts/1 harleypig
-#    24871 USER_PROCESS  1322895785 pts/2 harleypig
-#    24869 DEAD_PROCESS  1322910139 pts/2 harleypig
-#    24276 DEAD_PROCESS  1322910150 pts/1 harleypig
-#    26861 USER_PROCESS  1322919528 pts/1 robert
-#    27251 USER_PROCESS  1322919654 pts/2 robert
-#    28584 USER_PROCESS  1322923897 pts/3 robert
-#    27249 DEAD_PROCESS  1322924043 pts/3 robert
-#    27249 DEAD_PROCESS  1322924044 pts/2 robert
-#    26861 DEAD_PROCESS  1322924055 pts/1 robert
-#    28924 USER_PROCESS  1322924108 pts/1 james
-#    29152 USER_PROCESS  1322924135 pts/2 james
-#    29150 DEAD_PROCESS  1322927840 pts/2 james
-#    28924 DEAD_PROCESS  1322927858 pts/1 james
-#    30265 USER_PROCESS  1322928026 pts/1 patrick
-#    30712 USER_PROCESS  1322929706 pts/2 patrick
-#    30710 DEAD_PROCESS  1322929772 pts/2 patrick
-#    30856 USER_PROCESS  1322929793 pts/2 patrick
-#    30854 DEAD_PROCESS  1322930130 pts/2 patrick
-#    30265 DEAD_PROCESS  1322930140 pts/1 patrick
-#    32051 USER_PROCESS  1322930160 pts/1 harleypig
-#    32051 DEAD_PROCESS  1322930501 pts/1 harleypig
-#      690 USER_PROCESS  1322930741 pts/1 patrick
-#      690 DEAD_PROCESS  1322933997 pts/1 patrick
-#     1458 USER_PROCESS  1322949802 pts/1 harleypig
-#     2295 USER_PROCESS  1322952804 pts/2 harleypig
-#     2938 USER_PROCESS  1322956858 tty1  harleypig
-#     4010 USER_PROCESS  1322956859 tty1  harleypig
-#     2938 DEAD_PROCESS  1322956957 tty1
-#     4549 LOGIN_PROCESS 1322956957 tty1  LOGIN
-#     2293 DEAD_PROCESS  1322956979 pts/2 harleypig
-#     1458 DEAD_PROCESS  1322956993 pts/1 harleypig
-#     4817 USER_PROCESS  1322957112 pts/1 robert
-#     5286 USER_PROCESS  1322959255 pts/2 robert
-#     5284 DEAD_PROCESS  1322959439 pts/2 robert
-#     4817 DEAD_PROCESS  1322959448 pts/1 robert
-#     5633 USER_PROCESS  1322959890 pts/1 james
-#     6318 USER_PROCESS  1322961545 pts/2 james
-#     6316 DEAD_PROCESS  1322963914 pts/2 james
-#     5633 DEAD_PROCESS  1322963940 pts/1 james
-#     7063 USER_PROCESS  1322964040 pts/1 deedee
-#     7063 DEAD_PROCESS  1322967695 pts/1 deedee
-#     7749 USER_PROCESS  1322967719 pts/1 carrie
-#     4549 USER_PROCESS  1322968394 tty1  carrie
-#     8141 USER_PROCESS  1322968394 tty1  carrie
-#     4549 DEAD_PROCESS  1322968531 tty1
-#     4549 DEAD_PROCESS  1322968531 tty1
-#     8360 LOGIN_PROCESS 1322968531 tty1  LOGIN
-#     7749 DEAD_PROCESS  1322972878 pts/1 carrie
-#     8673 USER_PROCESS  1322972927 pts/1 robert
-#     8914 USER_PROCESS  1322972981 pts/2 robert
-#     8912 DEAD_PROCESS  1322974094 pts/2 robert
-#     8673 DEAD_PROCESS  1322974564 pts/1 robert
-#    10391 USER_PROCESS  1323007328 pts/1 robert
-#    10391 DEAD_PROCESS  1323010828 pts/1 robert
-#    12587 USER_PROCESS  1323010883 pts/1 james
-#    13889 USER_PROCESS  1323014555 pts/2 james
-#    13887 DEAD_PROCESS  1323014591 pts/2 james
-#    13928 USER_PROCESS  1323014612 pts/2 james
-#    13926 DEAD_PROCESS  1323014943 pts/2 james
-#    12587 DEAD_PROCESS  1323014983 pts/1 james
-#    14245 USER_PROCESS  1323016563 pts/1 robert
-#    14478 USER_PROCESS  1323016582 pts/2 robert
-#    14476 DEAD_PROCESS  1323016684 pts/2 robert
-#    14245 DEAD_PROCESS  1323016686 pts/1 robert
-#    14818 USER_PROCESS  1323016710 pts/1 robert
-#    15025 USER_PROCESS  1323016710 pts/2 robert
-#    15197 USER_PROCESS  1323016764 pts/3 robert
-#    14995 DEAD_PROCESS  1323016787 pts/3 robert
-#    14995 DEAD_PROCESS  1323018193 pts/2 robert
-#    14818 DEAD_PROCESS  1323018220 pts/1 robert
-#    15833 USER_PROCESS  1323018556 pts/1 robert
-#    16076 USER_PROCESS  1323018569 pts/2 robert
-#    16074 DEAD_PROCESS  1323018778 pts/2 robert
-#    15833 DEAD_PROCESS  1323018787 pts/1 robert
-#    16604 USER_PROCESS  1323026196 pts/1 robert
-#    16841 USER_PROCESS  1323026221 pts/2 robert
-#    16836 DEAD_PROCESS  1323030124 pts/2 robert
-#    16604 DEAD_PROCESS  1323030168 pts/1 robert
-#    18213 USER_PROCESS  1323034014 pts/1 james
-#    18555 USER_PROCESS  1323035630 pts/3 james
-#    18553 DEAD_PROCESS  1323039880 pts/3 james
-#    18213 DEAD_PROCESS  1323039966 pts/1 james
-#    19756 USER_PROCESS  1323043360 pts/1 carrie
-#        0 BOOT_TIME     1323043531 ~     reboot
-#       50 RUN_LVL       1323043531 ~     runlevel
-#      976 LOGIN_PROCESS 1323043531 tty4  LOGIN
-#      981 LOGIN_PROCESS 1323043531 tty5  LOGIN
-#      996 LOGIN_PROCESS 1323043531 tty2  LOGIN
-#      998 LOGIN_PROCESS 1323043531 tty3  LOGIN
-#     1007 LOGIN_PROCESS 1323043531 tty6  LOGIN
-#     1370 USER_PROCESS  1323043534 pts/0 harleypig
-#     1732 LOGIN_PROCESS 1323043535 tty1  LOGIN
-#     2538 USER_PROCESS  1323043607 pts/1 carrie
-#        0 BOOT_TIME     1323043725 ~     reboot
-#       50 RUN_LVL       1323043726 ~     runlevel
-#      967 LOGIN_PROCESS 1323043726 tty4  LOGIN
-#      973 LOGIN_PROCESS 1323043726 tty5  LOGIN
-#     1001 LOGIN_PROCESS 1323043726 tty2  LOGIN
-#     1004 LOGIN_PROCESS 1323043726 tty3  LOGIN
-#     1009 LOGIN_PROCESS 1323043726 tty6  LOGIN
-#     1311 USER_PROCESS  1323043728 pts/0 harleypig
-#     2664 LOGIN_PROCESS 1323043747 tty1  LOGIN
-#     2862 USER_PROCESS  1323043801 pts/1 carrie
-#        0 BOOT_TIME     1323043863 ~     reboot
-#       50 RUN_LVL       1323043863 ~     runlevel
-#      987 LOGIN_PROCESS 1323043863 tty4  LOGIN
-#      991 LOGIN_PROCESS 1323043863 tty5  LOGIN
-#     1009 LOGIN_PROCESS 1323043863 tty2  LOGIN
-#     1015 LOGIN_PROCESS 1323043863 tty3  LOGIN
-#     1028 LOGIN_PROCESS 1323043863 tty6  LOGIN
-#     1386 USER_PROCESS  1323043865 pts/0 harleypig
-#     2587 LOGIN_PROCESS 1323043873 tty1  LOGIN
-#     2896 USER_PROCESS  1323043970 pts/1 carrie
-#     2896 DEAD_PROCESS  1323049185 pts/1 carrie
-#     3604 USER_PROCESS  1323050512 pts/1 james
-#     3830 USER_PROCESS  1323050526 pts/2 james
-#     3828 DEAD_PROCESS  1323050672 pts/2 james
-#     3604 DEAD_PROCESS  1323050710 pts/1 james
-#     4101 USER_PROCESS  1323050980 pts/1 harleypig
-#     4347 USER_PROCESS  1323051019 pts/2 harleypig
-#     4345 DEAD_PROCESS  1323083655 pts/2 harleypig
-#     4101 DEAD_PROCESS  1323083656 pts/1 harleypig
-#     6113 USER_PROCESS  1323091299 pts/1 robert
-#     6357 USER_PROCESS  1323091380 pts/2 robert
-#     6355 DEAD_PROCESS  1323095310 pts/2 robert
-#     6113 DEAD_PROCESS  1323095322 pts/1 robert
-#     8001 USER_PROCESS  1323106050 pts/1 harleypig
-#     8207 USER_PROCESS  1323106050 pts/2 harleypig
-#     8167 DEAD_PROCESS  1323135428 pts/2 harleypig
-#     8001 DEAD_PROCESS  1323135429 pts/1 harleypig
-#    10121 USER_PROCESS  1323143919 pts/1 harleypig
-#     9958 USER_PROCESS  1323143921 pts/2 harleypig
-#    10447 USER_PROCESS  1323143924 pts/3 harleypig
-#    10116 DEAD_PROCESS  1323166920 pts/1 harleypig
-#    10116 DEAD_PROCESS  1323166921 pts/3 harleypig
-#     9958 DEAD_PROCESS  1323166922 pts/2 harleypig
-#    13465 USER_PROCESS  1323180667 pts/1 james
-#    13692 USER_PROCESS  1323180674 pts/2 james
-#    13690 DEAD_PROCESS  1323181260 pts/2 james
-#    13465 DEAD_PROCESS  1323181295 pts/1 james
-#    14063 USER_PROCESS  1323181355 pts/1 patrick
-#    14063 DEAD_PROCESS  1323181884 pts/1 patrick
-#    14539 USER_PROCESS  1323182120 pts/1 robert
-#    15034 USER_PROCESS  1323182202 pts/2 robert
-#    15438 USER_PROCESS  1323182316 pts/1 robert
-#    15660 USER_PROCESS  1323182341 pts/2 robert
-#    15806 USER_PROCESS  1323182365 pts/3 robert
-#    15653 DEAD_PROCESS  1323182387 pts/3 robert
-#    15653 DEAD_PROCESS  1323182702 pts/2 robert
-#    15438 DEAD_PROCESS  1323182712 pts/1 robert
-#    16535 USER_PROCESS  1323208438 pts/1 james
-#    16859 USER_PROCESS  1323210330 pts/2 james
-#    16857 DEAD_PROCESS  1323212250 pts/2 james
-#    16535 DEAD_PROCESS  1323220748 pts/1 james
-#    18096 USER_PROCESS  1323221784 pts/1 robert
-#    19074 USER_PROCESS  1323229099 pts/2 robert
-#    19072 DEAD_PROCESS  1323230457 pts/2 robert
-#    18096 DEAD_PROCESS  1323230467 pts/1 robert
-#    19749 USER_PROCESS  1323230947 pts/1 darkshadow
-#    19749 DEAD_PROCESS  1323235455 pts/1 darkshadow
-#    21108 USER_PROCESS  1323237032 pts/1 harleypig
-#    21158 USER_PROCESS  1323237032 pts/2 harleypig
-#    20960 USER_PROCESS  1323237033 pts/3 harleypig
-#    21101 DEAD_PROCESS  1323245118 pts/2 harleypig
-#    21101 DEAD_PROCESS  1323245121 pts/1 harleypig
-#    20960 DEAD_PROCESS  1323245136 pts/3 harleypig
-#    24105 USER_PROCESS  1323265208 pts/1 harleypig
-#    24318 USER_PROCESS  1323265215 pts/2 harleypig
-#    24314 DEAD_PROCESS  1323275767 pts/2 harleypig
-#    24105 DEAD_PROCESS  1323275768 pts/1 harleypig
-#      461 USER_PROCESS  1323292097 pts/1 james
-#      817 USER_PROCESS  1323293520 pts/2 james
-#      815 DEAD_PROCESS  1323293532 pts/2 james
-#      829 USER_PROCESS  1323293539 pts/2 james
-#      826 DEAD_PROCESS  1323297020 pts/2 james
-#      461 DEAD_PROCESS  1323297353 pts/1 james
-#     2520 USER_PROCESS  1323298823 pts/1 james
-#     2520 DEAD_PROCESS  1323298844 pts/1 james
-#     2902 USER_PROCESS  1323298935 pts/1 robert
-#     2902 DEAD_PROCESS  1323303560 pts/1 robert
-#     3740 USER_PROCESS  1323303584 pts/1 james
-#     3740 DEAD_PROCESS  1323307557 pts/1 james
-#     5208 USER_PROCESS  1323315198 pts/1 harleypig
-#     5407 USER_PROCESS  1323315198 pts/2 harleypig
-#     5375 DEAD_PROCESS  1323333799 pts/2 harleypig
-#     5208 DEAD_PROCESS  1323333816 pts/1 harleypig
-#     8694 USER_PROCESS  1323351853 pts/1 robert
-#     8694 DEAD_PROCESS  1323354514 pts/1 robert
-#    10808 USER_PROCESS  1323381176 pts/1 james
-#    10612 USER_PROCESS  1323381176 pts/2 james
-#    10829 USER_PROCESS  1323381178 pts/5 james
-#    10805 DEAD_PROCESS  1323381248 pts/5 james
-#    10805 DEAD_PROCESS  1323381257 pts/1 james
-#    10612 DEAD_PROCESS  1323381260 pts/2 james
-#    11496 USER_PROCESS  1323386760 pts/1 james
-#    11311 USER_PROCESS  1323386785 pts/2 james
-#    11480 DEAD_PROCESS  1323386952 pts/1 james
-#    11311 DEAD_PROCESS  1323388654 pts/2 james
-#    11986 USER_PROCESS  1323388689 pts/1 james
-#    12209 USER_PROCESS  1323388693 pts/2 james
-#    12207 DEAD_PROCESS  1323388907 pts/2 james
-#    11986 DEAD_PROCESS  1323388946 pts/1 james
-#    12489 USER_PROCESS  1323389319 pts/1 robert
-#    12489 DEAD_PROCESS  1323390926 pts/1 robert
-#    13120 USER_PROCESS  1323390972 pts/1 patrick
-#    13120 DEAD_PROCESS  1323393659 pts/1 patrick
-#    13740 USER_PROCESS  1323393709 pts/1 james
-#    14088 USER_PROCESS  1323395267 pts/2 james
-#    14086 DEAD_PROCESS  1323397605 pts/2 james
-#    13740 DEAD_PROCESS  1323397667 pts/1 james
-#    15269 USER_PROCESS  1323407250 pts/1 harleypig
-#    15506 USER_PROCESS  1323407281 pts/5 harleypig
-#    15564 USER_PROCESS  1323407285 pts/6 harleypig
-#    15502 DEAD_PROCESS  1323407355 pts/6 harleypig
-#    12854 RUN_LVL       1323407584 ~     runlevel
-#      987 DEAD_PROCESS  1323407588 tty4
-#      991 DEAD_PROCESS  1323407588 tty5
-#     1009 DEAD_PROCESS  1323407588 tty2
-#     1015 DEAD_PROCESS  1323407588 tty3
-#     1028 DEAD_PROCESS  1323407588 tty6
-#     2587 DEAD_PROCESS  1323407588 tty1
-#     1386 DEAD_PROCESS  1323407611 pts/0 harleypig
-#        0 RUN_LVL       1323407626 ~     shutdown
-#        0 BOOT_TIME     1323407672 ~     reboot
-#       50 RUN_LVL       1323407672 ~     runlevel
-#     1006 LOGIN_PROCESS 1323407672 tty4  LOGIN
-#     1010 LOGIN_PROCESS 1323407672 tty5  LOGIN
-#     1037 LOGIN_PROCESS 1323407672 tty2  LOGIN
-#     1042 LOGIN_PROCESS 1323407672 tty3  LOGIN
-#     1049 LOGIN_PROCESS 1323407672 tty6  LOGIN
-#     1355 USER_PROCESS  1323407674 pts/0 harleypig
-#     2616 LOGIN_PROCESS 1323407691 tty1  LOGIN
-#     2782 USER_PROCESS  1323407743 pts/1 harleypig
-#     3120 USER_PROCESS  1323407744 pts/2 harleypig
-#     2990 DEAD_PROCESS  1323424639 pts/2 harleypig
-#     2782 DEAD_PROCESS  1323424641 pts/1 harleypig
-#     5694 USER_PROCESS  1323439559 pts/1 robert
-#     5694 DEAD_PROCESS  1323440354 pts/1 robert
-#     8825 USER_PROCESS  1323483137 pts/1 carrie
-#        0 BOOT_TIME     1323483385 ~     reboot
-#       50 RUN_LVL       1323483385 ~     runlevel
-#      999 LOGIN_PROCESS 1323483385 tty4  LOGIN
-#     1003 LOGIN_PROCESS 1323483385 tty5  LOGIN
-#     1020 LOGIN_PROCESS 1323483385 tty2  LOGIN
-#     1025 LOGIN_PROCESS 1323483385 tty3  LOGIN
-#     1034 LOGIN_PROCESS 1323483385 tty6  LOGIN
-#     1338 USER_PROCESS  1323483387 pts/0 harleypig
-#     2593 LOGIN_PROCESS 1323483398 tty1  LOGIN
-#     2721 USER_PROCESS  1323483422 pts/1 carrie
-#     3630 USER_PROCESS  1323492083 pts/1 harleypig
-#     3831 USER_PROCESS  1323492083 pts/2 harleypig
-#     3773 DEAD_PROCESS  1323504815 pts/2 harleypig
-#     3630 DEAD_PROCESS  1323504816 pts/1 harleypig
-#     5860 USER_PROCESS  1323518845 pts/1 robert
-#     6333 USER_PROCESS  1323519057 pts/2 robert
-#     6449 USER_PROCESS  1323519139 pts/3 robert
-#     6331 DEAD_PROCESS  1323519146 pts/3 robert
-#     6331 DEAD_PROCESS  1323519148 pts/2 robert
-#     6561 USER_PROCESS  1323519152 pts/2 robert
-#     6559 DEAD_PROCESS  1323519168 pts/2 robert
-#     5860 DEAD_PROCESS  1323523522 pts/1 robert
-#     8040 USER_PROCESS  1323531110 pts/1 james
-#     8267 USER_PROCESS  1323531131 pts/2 james
-#     8262 DEAD_PROCESS  1323532477 pts/2 james
-#     8040 DEAD_PROCESS  1323532706 pts/1 james
-#     8881 USER_PROCESS  1323534338 pts/1 james
-#     9108 USER_PROCESS  1323534350 pts/2 james
-#     9106 DEAD_PROCESS  1323535660 pts/2 james
-#     8881 DEAD_PROCESS  1323535740 pts/1 james
-#    10035 USER_PROCESS  1323546404 pts/1 harleypig
-#     9870 USER_PROCESS  1323546405 pts/2 harleypig
-#    11189 USER_PROCESS  1323552343 pts/3 harleypig
-#    10026 DEAD_PROCESS  1323564714 pts/3 harleypig
-#    10026 DEAD_PROCESS  1323564720 pts/1 harleypig
-#     9870 DEAD_PROCESS  1323564743 pts/2 harleypig
-#     7293 USER_PROCESS  1323564816 pts/1 james
-#     7293 DEAD_PROCESS  1323565816 pts/1 james
-#     7976 USER_PROCESS  1323572294 pts/1 james
-#     7976 DEAD_PROCESS  1323578375 pts/1 james
-#     9631 USER_PROCESS  1323579167 pts/1 james
-#     9631 DEAD_PROCESS  1323579507 pts/1 james
-#    10150 USER_PROCESS  1323579532 pts/1 harleypig
-#    10760 USER_PROCESS  1323579575 pts/2 harleypig
-#    10758 DEAD_PROCESS  1323580917 pts/2 harleypig
-#    11588 USER_PROCESS  1323581012 pts/2 harleypig
-#    10150 DEAD_PROCESS  1323581029 pts/1 harleypig
-#     1338 DEAD_PROCESS  1323581031 pts/0 harleypig
-#     2593 USER_PROCESS  1323581048 tty1  harleypig
-#    12205 USER_PROCESS  1323581049 tty1  harleypig
-#     2593 DEAD_PROCESS  1323581123 tty1
-#    13609 LOGIN_PROCESS 1323581123 tty1  LOGIN
-#    14429 USER_PROCESS  1323617284 pts/2 james
-#    14429 DEAD_PROCESS  1323617694 pts/2 james
-#    15144 USER_PROCESS  1323630980 pts/2 james
-#    15144 DEAD_PROCESS  1323632683 pts/2 james
-#    15809 USER_PROCESS  1323634616 pts/2 james
-#    16420 USER_PROCESS  1323636994 pts/3 james
-#    16418 DEAD_PROCESS  1323639883 pts/3 james
-#    15809 DEAD_PROCESS  1323640028 pts/2 james
-#    17355 USER_PROCESS  1323641689 pts/2 harleypig
-#    17538 USER_PROCESS  1323641692 pts/3 harleypig
-#    12854 RUN_LVL       1323641997 ~     runlevel
-#      999 DEAD_PROCESS  1323641998 tty4
-#     1003 DEAD_PROCESS  1323641998 tty5
-#     1020 DEAD_PROCESS  1323641998 tty2
-#     1025 DEAD_PROCESS  1323641998 tty3
-#     1034 DEAD_PROCESS  1323641998 tty6
-#    13609 DEAD_PROCESS  1323641998 tty1
-#        0 RUN_LVL       1323642009 ~     shutdown
-#        0 BOOT_TIME     1323642059 ~     reboot
-#       50 RUN_LVL       1323642059 ~     runlevel
-#      995 LOGIN_PROCESS 1323642059 tty4  LOGIN
-#      999 LOGIN_PROCESS 1323642059 tty5  LOGIN
-#     1017 LOGIN_PROCESS 1323642059 tty2  LOGIN
-#     1018 LOGIN_PROCESS 1323642059 tty3  LOGIN
-#     1038 LOGIN_PROCESS 1323642059 tty6  LOGIN
-#     1342 USER_PROCESS  1323642062 pts/0 harleypig
-#     2790 LOGIN_PROCESS 1323642113 tty1  LOGIN
-#     2730 USER_PROCESS  1323642158 pts/1 harleypig
-#     3203 USER_PROCESS  1323642165 pts/2 harleypig
-#     9218 USER_PROCESS  1323659750 pts/5 harleypig
-#     3195 DEAD_PROCESS  1323689886 pts/5 harleypig
-#     3195 DEAD_PROCESS  1323689891 pts/2 harleypig
-#     2730 DEAD_PROCESS  1323689920 pts/1 harleypig
-#    15076 USER_PROCESS  1323695404 pts/1 robert
-#    15076 DEAD_PROCESS  1323699360 pts/1 robert
-#    16190 USER_PROCESS  1323704396 pts/1 harleypig
-#    16810 USER_PROCESS  1323704641 pts/2 harleypig
-#    19594 USER_PROCESS  1323713535 pts/4 harleypig
-#    20399 USER_PROCESS  1323716319 pts/5 harleypig
-#    16808 DEAD_PROCESS  1323718852 pts/4 harleypig
-#    16808 DEAD_PROCESS  1323733432 pts/2 harleypig
-#    16808 DEAD_PROCESS  1323733433 pts/5 harleypig
-#    16190 DEAD_PROCESS  1323733471 pts/1 harleypig
-#    24022 USER_PROCESS  1323733540 pts/1 james
-#    24022 DEAD_PROCESS  1323737600 pts/1 james
-#    25107 USER_PROCESS  1323740026 pts/1 robert
-#    25641 USER_PROCESS  1323740510 pts/2 robert
-#    25639 DEAD_PROCESS  1323740559 pts/2 robert
-#    26025 USER_PROCESS  1323742106 pts/2 robert
-#    26023 DEAD_PROCESS  1323742325 pts/2 robert
-#    26374 USER_PROCESS  1323742914 pts/2 robert
-#    26372 DEAD_PROCESS  1323745273 pts/2 robert
-#    25107 DEAD_PROCESS  1323745284 pts/1 robert
-#    29035 USER_PROCESS  1323746275 pts/1 harleypig
-#    29037 USER_PROCESS  1323746275 pts/2 harleypig
-#    28865 USER_PROCESS  1323746276 pts/4 harleypig
-#    29017 DEAD_PROCESS  1323760538 pts/2 harleypig
-#    29017 DEAD_PROCESS  1323760614 pts/1 harleypig
-#    28865 DEAD_PROCESS  1323760626 pts/4 harleypig
-#    31686 USER_PROCESS  1323784328 pts/1 robert
-#    31930 USER_PROCESS  1323784339 pts/2 robert
-#    31926 DEAD_PROCESS  1323784384 pts/2 robert
-#    32084 USER_PROCESS  1323784392 pts/2 robert
-#    32082 DEAD_PROCESS  1323787244 pts/2 robert
-#    31686 DEAD_PROCESS  1323787257 pts/1 robert
-#     2201 USER_PROCESS  1323813907 pts/1 james
-#     2421 USER_PROCESS  1323813926 pts/2 james
-#     2419 DEAD_PROCESS  1323815878 pts/2 james
-#     2201 DEAD_PROCESS  1323815935 pts/1 james
-#     3172 USER_PROCESS  1323815978 pts/1 james
-#     3172 DEAD_PROCESS  1323820058 pts/1 james
-#     4205 USER_PROCESS  1323822324 pts/1 robert
-#     4443 USER_PROCESS  1323822352 pts/4 robert
-#     4441 DEAD_PROCESS  1323826067 pts/4 robert
-#     5457 USER_PROCESS  1323826759 pts/4 robert
-#     5453 DEAD_PROCESS  1323827932 pts/4 robert
-#     4205 DEAD_PROCESS  1323832614 pts/1 robert
-#     7611 USER_PROCESS  1323832670 pts/1 james
-#     7611 DEAD_PROCESS  1323835337 pts/1 james
-#     8682 USER_PROCESS  1323836502 pts/1 darkshadow
-#     8682 DEAD_PROCESS  1323836811 pts/1 darkshadow
-#    12854 RUN_LVL       1323836817 ~     runlevel
-#      995 DEAD_PROCESS  1323836819 tty4
-#      999 DEAD_PROCESS  1323836819 tty5
-#     1017 DEAD_PROCESS  1323836819 tty2
-#     1018 DEAD_PROCESS  1323836819 tty3
-#     1038 DEAD_PROCESS  1323836819 tty6
-#     2790 DEAD_PROCESS  1323836819 tty1
-#     1342 DEAD_PROCESS  1323836836 pts/0 harleypig
-#        0 RUN_LVL       1323836858 ~     shutdown
-#        0 BOOT_TIME     1323836930 ~     reboot
-#       50 RUN_LVL       1323836930 ~     runlevel
-#      956 LOGIN_PROCESS 1323836930 tty4  LOGIN
-#      961 LOGIN_PROCESS 1323836930 tty5  LOGIN
-#      977 LOGIN_PROCESS 1323836930 tty2  LOGIN
-#      979 LOGIN_PROCESS 1323836930 tty3  LOGIN
-#      993 LOGIN_PROCESS 1323836930 tty6  LOGIN
-#     1359 USER_PROCESS  1323836933 pts/0 harleypig
-#     2934 LOGIN_PROCESS 1323837031 tty1  LOGIN
-#     2865 USER_PROCESS  1323837059 pts/1 darkshadow
-#     2865 DEAD_PROCESS  1323839809 pts/1 darkshadow
-#     3745 USER_PROCESS  1323841017 pts/1 harleypig
-#     4017 USER_PROCESS  1323841062 pts/2 harleypig
-#     4728 USER_PROCESS  1323841080 pts/4 harleypig
-#     4015 DEAD_PROCESS  1323853668 pts/2 harleypig
-#     4015 DEAD_PROCESS  1323853669 pts/4 harleypig
-#     3745 DEAD_PROCESS  1323853683 pts/1 harleypig
-#     7434 USER_PROCESS  1323853781 pts/1 darkshadow
-#     7434 DEAD_PROCESS  1323855884 pts/1 darkshadow
-#     8104 USER_PROCESS  1323858631 pts/1 darkshadow
-#     8104 DEAD_PROCESS  1323860873 pts/1 darkshadow
-#     8930 USER_PROCESS  1323867950 pts/1 robert
-#     9170 USER_PROCESS  1323867970 pts/2 robert
-#     9168 DEAD_PROCESS  1323873480 pts/2 robert
-#     8930 DEAD_PROCESS  1323873489 pts/1 robert
-#    10947 USER_PROCESS  1323873984 pts/1 harleypig
-#    10947 DEAD_PROCESS  1323878846 pts/1 harleypig
-#    12375 USER_PROCESS  1323890494 pts/1 darkshadow
-#    12375 DEAD_PROCESS  1323896090 pts/1 darkshadow
-#    13429 USER_PROCESS  1323896987 pts/1 james
-#    13429 DEAD_PROCESS  1323905300 pts/1 james
-#    15217 USER_PROCESS  1323905340 pts/1 robert
-#    15462 USER_PROCESS  1323905366 pts/2 robert
-#    15460 DEAD_PROCESS  1323909725 pts/2 robert
-#    15217 DEAD_PROCESS  1323909739 pts/1 robert
-#    16861 USER_PROCESS  1323909777 pts/1 james
-#    16861 DEAD_PROCESS  1323911411 pts/1 james
-#    17705 USER_PROCESS  1323912625 pts/1 james
-#    18377 USER_PROCESS  1323914689 pts/2 james
-#    18375 DEAD_PROCESS  1323915211 pts/2 james
-#    17705 DEAD_PROCESS  1323920662 pts/1 james
-#    19562 USER_PROCESS  1323920727 pts/1 robert
-#    19788 USER_PROCESS  1323920739 pts/2 robert
-#    19786 DEAD_PROCESS  1323922081 pts/2 robert
-#    19562 DEAD_PROCESS  1323922174 pts/1 robert
-#    20465 USER_PROCESS  1323922499 pts/1 darkshadow
-#    20465 DEAD_PROCESS  1323923700 pts/1 darkshadow
-#    21147 USER_PROCESS  1323924281 pts/1 harleypig
-#    21790 USER_PROCESS  1323924312 pts/2 harleypig
-#    22132 USER_PROCESS  1323924350 pts/4 harleypig
-#    21786 DEAD_PROCESS  1323936630 pts/2 harleypig
-#    21786 DEAD_PROCESS  1323936633 pts/4 harleypig
-#    21147 DEAD_PROCESS  1323936653 pts/1 harleypig
-#    10700 USER_PROCESS  1323959230 pts/1 robert
-#    10950 USER_PROCESS  1323959260 pts/2 robert
-#    10948 DEAD_PROCESS  1323959522 pts/2 robert
-#    10700 DEAD_PROCESS  1323959530 pts/1 robert
-#    12167 USER_PROCESS  1323960591 pts/1 harleypig
-#    12367 USER_PROCESS  1323960591 pts/2 harleypig
-#    12376 USER_PROCESS  1323960591 pts/4 harleypig
-#    12854 RUN_LVL       1323960821 ~     runlevel
-#      956 DEAD_PROCESS  1323960823 tty4
-#      961 DEAD_PROCESS  1323960823 tty5
-#      977 DEAD_PROCESS  1323960823 tty2
-#      979 DEAD_PROCESS  1323960823 tty3
-#      993 DEAD_PROCESS  1323960823 tty6
-#     2934 DEAD_PROCESS  1323960823 tty1
-#     1359 DEAD_PROCESS  1323960841 pts/0 harleypig
-#        0 RUN_LVL       1323960857 ~     shutdown
-#        0 BOOT_TIME     1323960908 ~     reboot
-#       50 RUN_LVL       1323960908 ~     runlevel
-#     1062 LOGIN_PROCESS 1323960908 tty5  LOGIN
-#     1057 LOGIN_PROCESS 1323960908 tty4  LOGIN
-#     1099 LOGIN_PROCESS 1323960908 tty2  LOGIN
-#     1100 LOGIN_PROCESS 1323960908 tty3  LOGIN
-#     1103 LOGIN_PROCESS 1323960908 tty6  LOGIN
-#     1532 USER_PROCESS  1323960937 pts/0 harleypig
-#     2299 LOGIN_PROCESS 1323960956 tty1  LOGIN
-#     2299 USER_PROCESS  1323961033 tty1  harleypig
-#     3158 USER_PROCESS  1323961033 tty1  harleypig
-#     1532 DEAD_PROCESS  1323961048 pts/0 harleypig
-#    12848 RUN_LVL       1323961198 ~     runlevel
-#     1057 DEAD_PROCESS  1323961199 tty4
-#     1062 DEAD_PROCESS  1323961199 tty5
-#     1099 DEAD_PROCESS  1323961199 tty2
-#     1100 DEAD_PROCESS  1323961199 tty3
-#     1103 DEAD_PROCESS  1323961199 tty6
-#        0 RUN_LVL       1323961202 ~     shutdown
-#        0 BOOT_TIME     1323961260 ~     reboot
-#       50 RUN_LVL       1323961260 ~     runlevel
-#     1001 LOGIN_PROCESS 1323961260 tty4  LOGIN
-#     1005 LOGIN_PROCESS 1323961260 tty5  LOGIN
-#     1030 LOGIN_PROCESS 1323961260 tty2  LOGIN
-#     1033 LOGIN_PROCESS 1323961260 tty3  LOGIN
-#     1044 LOGIN_PROCESS 1323961260 tty6  LOGIN
-#     1346 USER_PROCESS  1323961262 pts/0 harleypig
-#     2675 LOGIN_PROCESS 1323961271 tty1  LOGIN
-#     3205 USER_PROCESS  1323961532 pts/1 harleypig
-#     3221 USER_PROCESS  1323961532 pts/2 harleypig
-#     3016 USER_PROCESS  1323961557 pts/3 harleypig
-#     2675 USER_PROCESS  1323964252 tty1  harleypig
-#     5923 USER_PROCESS  1323964252 tty1  harleypig
-#     2675 DEAD_PROCESS  1323964274 tty1
-#     6529 LOGIN_PROCESS 1323964274 tty1  LOGIN
-#     6529 USER_PROCESS  1323964326 tty1  harleypig
-#     6661 USER_PROCESS  1323964326 tty1  harleypig
-#     6529 DEAD_PROCESS  1323964336 tty1
-#     6529 DEAD_PROCESS  1323964336 tty1
-#     7227 LOGIN_PROCESS 1323964336 tty1  LOGIN
-#     3167 DEAD_PROCESS  1323964770 pts/1 harleypig
-#     3167 DEAD_PROCESS  1323964770 pts/2 harleypig
-#     3016 DEAD_PROCESS  1323964780 pts/3 harleypig
-#     7756 USER_PROCESS  1323971438 pts/1 darkshadow
-#     7756 DEAD_PROCESS  1323986828 pts/1 darkshadow
-#     9812 USER_PROCESS  1323986897 pts/1 darkshadow
-#     9812 DEAD_PROCESS  1323989057 pts/1 darkshadow
-#    10522 USER_PROCESS  1323989128 pts/1 james
-#        0 BOOT_TIME     1323993313 ~     reboot
-#       50 RUN_LVL       1323993313 ~     runlevel
-#      959 LOGIN_PROCESS 1323993313 tty4  LOGIN
-#      963 LOGIN_PROCESS 1323993313 tty5  LOGIN
-#      980 LOGIN_PROCESS 1323993313 tty2  LOGIN
-#      985 LOGIN_PROCESS 1323993313 tty3  LOGIN
-#      994 LOGIN_PROCESS 1323993313 tty6  LOGIN
-#     1357 USER_PROCESS  1323993316 pts/0 harleypig
-#     2830 LOGIN_PROCESS 1323993347 tty1  LOGIN
-#     2944 USER_PROCESS  1323993469 pts/1 robert
-#        0 BOOT_TIME     1323993834 ~     reboot
-#       50 RUN_LVL       1323993834 ~     runlevel
-#     1108 LOGIN_PROCESS 1323993834 tty4  LOGIN
-#     1112 LOGIN_PROCESS 1323993834 tty5  LOGIN
-#     1125 LOGIN_PROCESS 1323993834 tty2  LOGIN
-#     1126 LOGIN_PROCESS 1323993834 tty3  LOGIN
-#     1129 LOGIN_PROCESS 1323993834 tty6  LOGIN
-#     1456 USER_PROCESS  1323993836 pts/0 harleypig
-#     1981 LOGIN_PROCESS 1323993836 tty1  LOGIN
-#     2907 USER_PROCESS  1323993893 pts/1 robert
-#        0 BOOT_TIME     1323994049 ~     reboot
-#       50 RUN_LVL       1323994049 ~     runlevel
-#      971 LOGIN_PROCESS 1323994049 tty4  LOGIN
-#      975 LOGIN_PROCESS 1323994049 tty5  LOGIN
-#      988 LOGIN_PROCESS 1323994049 tty2  LOGIN
-#      989 LOGIN_PROCESS 1323994049 tty3  LOGIN
-#      992 LOGIN_PROCESS 1323994049 tty6  LOGIN
-#     1372 USER_PROCESS  1323994051 pts/0 harleypig
-#     2687 LOGIN_PROCESS 1323994069 tty1  LOGIN
-#     2924 USER_PROCESS  1323994197 pts/1 robert
-#     3191 USER_PROCESS  1323994232 pts/2 robert
-#        0 BOOT_TIME     1323994366 ~     reboot
-#       50 RUN_LVL       1323994366 ~     runlevel
-#      986 LOGIN_PROCESS 1323994366 tty4  LOGIN
-#      991 LOGIN_PROCESS 1323994366 tty5  LOGIN
-#     1021 LOGIN_PROCESS 1323994366 tty2  LOGIN
-#     1024 LOGIN_PROCESS 1323994366 tty3  LOGIN
-#     1029 LOGIN_PROCESS 1323994366 tty6  LOGIN
-#     1379 USER_PROCESS  1323994368 pts/0 harleypig
-#     2909 LOGIN_PROCESS 1323994399 tty1  LOGIN
-#     2975 USER_PROCESS  1323994524 pts/1 robert
-#        0 BOOT_TIME     1323994613 ~     reboot
-#       50 RUN_LVL       1323994613 ~     runlevel
-#      978 LOGIN_PROCESS 1323994613 tty4  LOGIN
-#      982 LOGIN_PROCESS 1323994613 tty5  LOGIN
-#      999 LOGIN_PROCESS 1323994613 tty2  LOGIN
-#     1000 LOGIN_PROCESS 1323994613 tty3  LOGIN
-#     1003 LOGIN_PROCESS 1323994613 tty6  LOGIN
-#     1385 USER_PROCESS  1323994615 pts/0 harleypig
-#     2570 LOGIN_PROCESS 1323994622 tty1  LOGIN
-#     3248 USER_PROCESS  1324013472 pts/1 harleypig
-#     3248 DEAD_PROCESS  1324013603 pts/1 harleypig
-#     3743 USER_PROCESS  1324013621 pts/1 harleypig
-#     3979 USER_PROCESS  1324013808 pts/2 harleypig
-#     4654 USER_PROCESS  1324013847 pts/4 harleypig
-#     3977 DEAD_PROCESS  1324024562 pts/2 harleypig
-#     3977 DEAD_PROCESS  1324024563 pts/4 harleypig
-#     3743 DEAD_PROCESS  1324024565 pts/1 harleypig
-#     7564 USER_PROCESS  1324045568 pts/1 harleypig
-#     7566 USER_PROCESS  1324045568 pts/2 harleypig
-#     7387 USER_PROCESS  1324045568 pts/4 harleypig
-#     7536 DEAD_PROCESS  1324049105 pts/1 harleypig
-#     7536 DEAD_PROCESS  1324049105 pts/2 harleypig
-#     7387 DEAD_PROCESS  1324049367 pts/4 harleypig
-#    10220 USER_PROCESS  1324086091 pts/1 harleypig
-#    10478 USER_PROCESS  1324086117 pts/2 harleypig
-#    10476 DEAD_PROCESS  1324114179 pts/2 harleypig
-#    10220 DEAD_PROCESS  1324114183 pts/1 harleypig
-#    14574 USER_PROCESS  1324140851 pts/1 robert
-#    14967 USER_PROCESS  1324141093 pts/2 robert
-#    15717 USER_PROCESS  1324141364 pts/4 robert
-#    15876 USER_PROCESS  1324141415 pts/7 robert
-#    14965 DEAD_PROCESS  1324141438 pts/7 robert
-#    15989 USER_PROCESS  1324141447 pts/7 robert
-#    14965 DEAD_PROCESS  1324141780 pts/4 robert
-#    14965 DEAD_PROCESS  1324141782 pts/7 robert
-#    14965 DEAD_PROCESS  1324144642 pts/2 robert
-#    14574 DEAD_PROCESS  1324144664 pts/1 robert
-#    16941 USER_PROCESS  1324144705 pts/2 harleypig
-#    17128 USER_PROCESS  1324144706 pts/1 harleypig
-#    17088 DEAD_PROCESS  1324152573 pts/1 harleypig
-#    16941 DEAD_PROCESS  1324152585 pts/2 harleypig
-#    19266 USER_PROCESS  1324168995 pts/1 robert
-#        0 BOOT_TIME     1324169258 ~     reboot
-#       50 RUN_LVL       1324169258 ~     runlevel
-#      956 LOGIN_PROCESS 1324169258 tty4  LOGIN
-#      968 LOGIN_PROCESS 1324169258 tty5  LOGIN
-#      988 LOGIN_PROCESS 1324169258 tty2  LOGIN
-#      990 LOGIN_PROCESS 1324169258 tty3  LOGIN
-#     1001 LOGIN_PROCESS 1324169258 tty6  LOGIN
-#     1387 USER_PROCESS  1324169260 pts/0 harleypig
-#     2786 LOGIN_PROCESS 1324169285 tty1  LOGIN
-#     2933 USER_PROCESS  1324169419 pts/1 robert
-#     2933 DEAD_PROCESS  1324170872 pts/1 robert
-#     3833 USER_PROCESS  1324177247 pts/1 harleypig
-#     4469 USER_PROCESS  1324178980 pts/3 robert
-#     4469 DEAD_PROCESS  1324179000 pts/3 robert
-#     4893 USER_PROCESS  1324180832 pts/3 darkshadow
-#     4893 DEAD_PROCESS  1324204469 pts/3 darkshadow
-#     9338 USER_PROCESS  1324216954 pts/1 james
-#     9338 DEAD_PROCESS  1324219761 pts/1 james
-#    10297 USER_PROCESS  1324221374 pts/1 robert
-#    11208 USER_PROCESS  1324226560 pts/3 robert
-#    11206 DEAD_PROCESS  1324226657 pts/3 robert
-#    10297 DEAD_PROCESS  1324227726 pts/1 robert
-#     2786 USER_PROCESS  1324235923 tty1  harleypig
-#    11952 USER_PROCESS  1324235924 tty1  harleypig
-#    12854 RUN_LVL       1324235977 ~     runlevel
-#      956 DEAD_PROCESS  1324235979 tty4
-#      968 DEAD_PROCESS  1324235980 tty5
-#      988 DEAD_PROCESS  1324235980 tty2
-#      990 DEAD_PROCESS  1324235980 tty3
-#     1001 DEAD_PROCESS  1324235980 tty6
-#     1387 DEAD_PROCESS  1324235996 pts/0 harleypig
-#        0 RUN_LVL       1324236019 ~     shutdown
-#        0 BOOT_TIME     1324236281 ~     reboot
-#       50 RUN_LVL       1324236281 ~     runlevel
-#      969 LOGIN_PROCESS 1324236281 tty4  LOGIN
-#      974 LOGIN_PROCESS 1324236281 tty5  LOGIN
-#      987 LOGIN_PROCESS 1324236281 tty2  LOGIN
-#      990 LOGIN_PROCESS 1324236281 tty3  LOGIN
-#      998 LOGIN_PROCESS 1324236281 tty6  LOGIN
-#     1361 USER_PROCESS  1324236283 pts/0 harleypig
-#     3036 LOGIN_PROCESS 1324236332 tty1  LOGIN
-#     3151 USER_PROCESS  1324242350 pts/1 harleypig
-#        0 BOOT_TIME     1324258426 ~     reboot
-#       50 RUN_LVL       1324258426 ~     runlevel
-#      989 LOGIN_PROCESS 1324258426 tty4  LOGIN
-#      995 LOGIN_PROCESS 1324258426 tty5  LOGIN
-#     1011 LOGIN_PROCESS 1324258426 tty2  LOGIN
-#     1012 LOGIN_PROCESS 1324258426 tty3  LOGIN
-#     1022 LOGIN_PROCESS 1324258426 tty6  LOGIN
-#     1382 USER_PROCESS  1324258428 pts/0 harleypig
-#     2846 LOGIN_PROCESS 1324258461 tty1  LOGIN
-#     3003 USER_PROCESS  1324258607 pts/1 robert
-#     3003 DEAD_PROCESS  1324261163 pts/1 robert
-#     4184 USER_PROCESS  1324261266 pts/1 harleypig
-#     4424 USER_PROCESS  1324261273 pts/2 harleypig
-#     4422 DEAD_PROCESS  1324287553 pts/2 harleypig
-#     4184 DEAD_PROCESS  1324287555 pts/1 harleypig
-#     6511 USER_PROCESS  1324293919 pts/1 james
-#     6511 DEAD_PROCESS  1324302944 pts/1 james
-#     7697 USER_PROCESS  1324304756 pts/1 harleypig
-#     8529 USER_PROCESS  1324308177 pts/3 robert
-#     8771 USER_PROCESS  1324308189 pts/4 robert
-#     8769 DEAD_PROCESS  1324308410 pts/4 robert
-#     9571 USER_PROCESS  1324310197 pts/4 robert
-#     9569 DEAD_PROCESS  1324310249 pts/4 robert
-#    10047 USER_PROCESS  1324312178 pts/4 robert
-#    10043 DEAD_PROCESS  1324325706 pts/4 robert
-#    15196 USER_PROCESS  1324330329 pts/1 robert
-#    15194 DEAD_PROCESS  1324330431 pts/1 robert
-#     8529 DEAD_PROCESS  1324334327 pts/3 robert
-#    16178 USER_PROCESS  1324334420 pts/1 james
-#    16178 DEAD_PROCESS  1324339482 pts/1 james
-#    17248 USER_PROCESS  1324339560 pts/1 robert
-#    17488 USER_PROCESS  1324339567 pts/3 robert
-#    17486 DEAD_PROCESS  1324340340 pts/3 robert
-#    17248 DEAD_PROCESS  1324342635 pts/1 robert
-#    18720 USER_PROCESS  1324342790 pts/1 james
-#    18917 USER_PROCESS  1324342790 pts/3 james
-#    18913 DEAD_PROCESS  1324343759 pts/3 james
-#    18720 DEAD_PROCESS  1324345330 pts/1 james
-#    19740 USER_PROCESS  1324346486 pts/1 robert
-#    19979 USER_PROCESS  1324346499 pts/3 robert
-#    19977 DEAD_PROCESS  1324346581 pts/3 robert
-#    20625 USER_PROCESS  1324349671 pts/3 robert
-#    20623 DEAD_PROCESS  1324349949 pts/3 robert
-#    21069 USER_PROCESS  1324349955 pts/3 robert
-#    21067 DEAD_PROCESS  1324351406 pts/3 robert
-#    19740 DEAD_PROCESS  1324351428 pts/1 robert
-#    21776 USER_PROCESS  1324351491 pts/1 james
-#    21776 DEAD_PROCESS  1324353544 pts/1 james
-#    22553 USER_PROCESS  1324355945 pts/1 darkshadow
-#    22553 DEAD_PROCESS  1324361867 pts/1 darkshadow
-#    24692 USER_PROCESS  1324387395 pts/1 james
-#    24692 DEAD_PROCESS  1324387570 pts/1 james
-#    25217 USER_PROCESS  1324389465 pts/1 james
-#    25217 DEAD_PROCESS  1324390847 pts/1 james
-#    25901 USER_PROCESS  1324390893 pts/1 robert
-#    26778 USER_PROCESS  1324391530 pts/3 robert
-#    26776 DEAD_PROCESS  1324391633 pts/3 robert
-#    25901 DEAD_PROCESS  1324391678 pts/1 robert
-#    27545 USER_PROCESS  1324393371 pts/1 harleypig
-#    29478 USER_PROCESS  1324418803 pts/4 james
-#    31283 USER_PROCESS  1324429768 pts/5 james
-#    31281 DEAD_PROCESS  1324429912 pts/5 james
-#    29478 DEAD_PROCESS  1324429968 pts/4 james
-#    31569 USER_PROCESS  1324431830 pts/4 james
-#    31569 DEAD_PROCESS  1324432378 pts/4 james
-#    32162 USER_PROCESS  1324433137 pts/4 harleypig
-#    32361 USER_PROCESS  1324433138 pts/5 harleypig
-#      477 USER_PROCESS  1324433224 pts/6 harleypig
-#    27545 DEAD_PROCESS  1324433304 pts/1
-#     2846 USER_PROCESS  1324434296 tty1  harleypig
-#     2815 USER_PROCESS  1324434298 tty1  harleypig
-#    12854 RUN_LVL       1324434309 ~     runlevel
-#      989 DEAD_PROCESS  1324434312 tty4
-#      995 DEAD_PROCESS  1324434312 tty5
-#     1011 DEAD_PROCESS  1324434312 tty2
-#     1012 DEAD_PROCESS  1324434312 tty3
-#     1022 DEAD_PROCESS  1324434312 tty6
-#     1382 DEAD_PROCESS  1324434332 pts/0 harleypig
-#        0 RUN_LVL       1324434343 ~     shutdown
-#        0 BOOT_TIME     1324434390 ~     reboot
-#       50 RUN_LVL       1324434390 ~     runlevel
-#      984 LOGIN_PROCESS 1324434390 tty4  LOGIN
-#      988 LOGIN_PROCESS 1324434390 tty5  LOGIN
-#     1003 LOGIN_PROCESS 1324434390 tty2  LOGIN
-#     1006 LOGIN_PROCESS 1324434390 tty3  LOGIN
-#     1010 LOGIN_PROCESS 1324434390 tty6  LOGIN
-#     1371 USER_PROCESS  1324434392 pts/0 harleypig
-#     1941 LOGIN_PROCESS 1324434394 tty1  LOGIN
-#     3068 USER_PROCESS  1324434521 pts/2 harleypig
-#     3299 USER_PROCESS  1324434524 pts/1 harleypig
-#     3302 USER_PROCESS  1324434524 pts/3 harleypig
-#     5019 USER_PROCESS  1324446167 pts/6 harleypig
-#     3238 DEAD_PROCESS  1324446167 pts/3 harleypig
-#     6503 USER_PROCESS  1324479050 pts/6 harleypig
-#     3238 DEAD_PROCESS  1324495178 pts/1 harleypig
-#     3068 DEAD_PROCESS  1324495186 pts/2 harleypig
-#     8107 USER_PROCESS  1324495594 pts/1 james
-#     8107 DEAD_PROCESS  1324515408 pts/1 james
-#    31366 USER_PROCESS  1324515477 pts/1 robert
-#    31702 USER_PROCESS  1324515484 pts/7 robert
-#    31693 DEAD_PROCESS  1324522076 pts/7 robert
-#    20491 USER_PROCESS  1324522158 pts/7 robert
-#    20486 DEAD_PROCESS  1324526085 pts/7 robert
-#    31366 DEAD_PROCESS  1324526178 pts/1 robert
-#    30533 USER_PROCESS  1324560727 pts/1 james
-#    30533 DEAD_PROCESS  1324564638 pts/1 james
-#    11897 USER_PROCESS  1324565341 pts/1 james
-#    11897 DEAD_PROCESS  1324568486 pts/1 james
-#    23842 USER_PROCESS  1324569627 pts/1 robert
-#    25708 USER_PROCESS  1324570126 pts/6 robert
-#    25702 DEAD_PROCESS  1324570225 pts/6 robert
-#    23842 DEAD_PROCESS  1324574965 pts/1 robert
-#     7454 USER_PROCESS  1324575027 pts/1 james
-#     7454 DEAD_PROCESS  1324579525 pts/1 james
-#    20428 USER_PROCESS  1324579615 pts/1 patrick
-#    20428 DEAD_PROCESS  1324584283 pts/1 patrick
-#     1390 USER_PROCESS  1324584358 pts/1 james
-#     1390 DEAD_PROCESS  1324586435 pts/1 james
-#    10035 USER_PROCESS  1324587168 pts/1 robert
-#    10621 USER_PROCESS  1324587221 pts/6 robert
-#    10615 DEAD_PROCESS  1324589039 pts/6 robert
-#    20283 USER_PROCESS  1324590633 pts/6 harleypig
-#    10035 DEAD_PROCESS  1324590668 pts/1 robert
-#    21244 USER_PROCESS  1324590740 pts/1 james
-#    21683 USER_PROCESS  1324590806 pts/8 james
-#    21681 DEAD_PROCESS  1324593818 pts/8 james
-#    30132 USER_PROCESS  1324593845 pts/9 james
-#    30121 DEAD_PROCESS  1324596843 pts/9 james
-#     9214 USER_PROCESS  1324597761 pts/9 james
-#     9203 DEAD_PROCESS  1324598560 pts/9 james
-#    21244 DEAD_PROCESS  1324598693 pts/1 james
-#    15609 USER_PROCESS  1324600036 pts/1 robert
-#    15609 DEAD_PROCESS  1324613201 pts/1 robert
-#    27942 USER_PROCESS  1324649139 pts/1 robert
-#     2730 USER_PROCESS  1324652224 pts/6 robert
-#     2724 DEAD_PROCESS  1324652301 pts/6 robert
-#     3370 USER_PROCESS  1324652391 pts/6 harleypig
-#     4443 USER_PROCESS  1324652551 pts/8 robert
-#     4441 DEAD_PROCESS  1324656208 pts/8 robert
-#        0 BOOT_TIME     1324656497 ~     reboot
-#       50 RUN_LVL       1324656497 ~     runlevel
-#     1010 LOGIN_PROCESS 1324656497 tty4  LOGIN
-#     1014 LOGIN_PROCESS 1324656497 tty5  LOGIN
-#     1032 LOGIN_PROCESS 1324656497 tty2  LOGIN
-#     1036 LOGIN_PROCESS 1324656497 tty3  LOGIN
-#     1045 LOGIN_PROCESS 1324656497 tty6  LOGIN
-#     1407 USER_PROCESS  1324656499 pts/0 harleypig
-#     1990 LOGIN_PROCESS 1324656502 tty1  LOGIN
-#     2994 USER_PROCESS  1324656646 pts/1 robert
-#     3564 USER_PROCESS  1324656693 pts/2 harleypig
 
 1;

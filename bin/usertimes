@@ -1,0 +1,13 @@
+#!/usr/bin/perl
+
+# ABSTRACT: A file used to test User::Times
+# PODNAME: usertimes
+
+use strict;
+use warnings;
+
+use User::Times;
+
+my $times = User::Times::user_times();
+
+print "Done.\n";
